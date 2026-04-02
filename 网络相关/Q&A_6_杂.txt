@@ -1,0 +1,246 @@
+dpdk包括以下几层
+环境抽象层（EAL）：屏蔽硬件差异，提供统一接口 学习目录:lib/librte_eal/
+    为上层提供统一的硬件访问接口
+    管理大页内存分配与NUMA亲和性------
+    实现UIO/VFIO机制将网卡PCIe设备映射到用户空间
+核心库（Core Libraries）：提供基础数据结构和算法
+    环,池，mbuf,lpm(hash)   学习目录:lib/librte_mempool/,lib/librte_ring/,lib/librte_mbuf/,lib/librte_lpm/、lib/librte_hash/
+轮询模式驱动（PMD）：用户态网卡驱动实现 drivers/net/
+    通过UIO/VFIO机制直接操作网卡
+    使用轮询模式替代中断模式
+    实现零拷贝数据包处理
+应用层（Applications）：基于DPDK构建的网络应用
+    example
+
+ring的多生产者多消费者,多生产者单消费者模型
+场景 A（MPSC）：多个网卡队列（由多个核心读取）的数据，需要汇总到一个核心进行处理。
+例如，你有 8 个网卡队列（8 个核心在读），但你只需要 1 个核心来处理所有数据包。
+这时，8 个生产者（读取队列的核心）向同一个 rte_ring 写入数据，1 个消费者
+（处理核心）从中读取。这就是“多生产者/单消费者”（MPSC）模型。
+场景 B（MPMC）：多个处理核心需要同时从同一个队列中获取数据进行并行处理。
+例如，你有一个队列的数据包需要进行加密，你希望用 4 个核心同时处理。
+这时，4 个消费者会竞争从同一个 rte_ring 中读取数据。这就是“多生产者/多消费者”（MPMC）模型。
+
+
+tcp流的流量控制
+目的是防止快发送方给慢接收方发数据造成接收缓冲区溢出的崩溃
+接收方根据缓存大小确定接收窗口大小，并通知发送方；发送方保证发送窗口小于接收窗口大小
+接收窗口大小：保持最后收到字节 - 最后读出字节 ＜ 缓冲区长度，即 接收窗口 = 缓冲区长度 - 已确认未读出长度
+（最后一个连续已确认字节序号 - 最后一个已读出字节序号）
+
+对于网元,无法对tcp流的流量控制进行干扰，但是还是有一些处理办法的
+处理方法————————————————
+拥塞避免：通过监视网络资源使用情况，在拥塞发生前主动采取措施
+尾部丢弃(Tail Drop)：当队列长度达到上限时丢弃新到达的数据包，防止缓冲区溢出
+加权随机早期检测(WRED)：在队列长度达到阈值前就开始随机丢弃数据包，避免TCP全局同步现象
+拥塞管理：在拥塞已发生时，通过调整报文调度次序确保关键业务优先处理
+优先队列(PQ)：按优先级顺序调度，高优先级业务先处理
+加权轮询(WRR)：按权重分配带宽，保证各业务公平使用资源
+加权赤字轮询(WDRR)：基于报文长度进行调度，更精确地控制带宽分配
+
+DMA（Direct Memory Access，直接内存访问）是一种硬件机制，允许外设（如网卡、磁盘驱动器、ADC等）与系统内存之间直接传输数据，无需CPU全程参与。
+它通过DMA控制器（DMAC）实现，这是一个专门的硬件组件，通常集成在芯片组或SoC中。
+2. DMA的核心作用
+减轻CPU负担：将CPU从繁琐的数据搬运工作中解放出来，使其能专注于逻辑控制和算法运算。
+提高数据传输效率：实现高速数据传输，尤其适合处理大量数据的场景。
+降低系统延迟：避免因CPU忙于其他任务而导致数据丢失（如ADC采样中的Overrun）。
+降低功耗：CPU可在DMA工作时进入低功耗模式，仅在传输完成时被唤醒。
+3. DMA的工作原理
+DMA的工作过程可分为四个阶段：
+DMA请求：外设向DMA控制器发送请求信号
+DMA响应：DMA控制器接管总线控制权
+数据传输：DMA控制器直接在设备和内存之间搬运数据
+传输结束：DMA控制器向CPU发送中断，交还总线控制权
+
+
+dpdk的处理和初始化流程:
+1. 初始化阶段
+环境准备：
+加载UIO驱动（如igb_uio.ko），将网卡从内核驱动解绑
+通过rte_eal_init()初始化EAL环境，配置大页内存
+描述符环创建：
+调用rte_eth_rx_queue_setup()为每个RX队列分配：
+rx_ring：硬件描述符环，存储描述符（含物理地址）
+sw_ring：软件环，存储对应mbuf的虚拟地址指针
+驱动从内存池(rte_mempool)中预分配mbuf，填充描述符
+网卡配置：
+设置网卡的接收/发送描述符数量（如40G网卡通常配置2048个收包描述符）
+配置RSS（接收端缩放）实现多队列负载均衡
+
+2. 数据包接收流程（RX）
+网卡收包：
+数据包到达网卡，暂存于RX_FIFO缓冲区
+网卡DMA引擎从rx_ring获取可用描述符，读取其中的物理地址
+通过PCIe总线，不经过CPU，直接将数据包写入mbuf数据缓冲区
+状态更新：
+DMA写入完成后，网卡回写描述符，更新状态信息
+将DD位置为1，表示数据包已就绪，所有权归还给驱动
+应用轮询：
+应用调用rte_eth_rx_burst()，检查rx_ring中DD位为1的描述符
+从sw_ring获取对应mbuf指针，更新mbuf元数据（包长度、端口等）
+将mbuf传递给上层应用处理
+资源回收：
+驱动为已处理的描述符重新分配新的空mbuf
+将描述符状态位清零，移交给网卡用于接收新数据包
+
+3. 数据包发送流程（TX）
+应用准备：
+应用将待发送数据包的mbuf指针传入rte_eth_tx_burst()
+PMD驱动将mbuf数据缓冲区的物理地址填入TX描述符
+网卡发送：
+网卡DMA引擎从TX描述符环读取描述符
+根据描述符中的物理地址，从mbuf数据缓冲区读取数据包
+通过PCIe总线将数据包发送到网络
+状态确认：
+发送完成后，网卡回写描述符，更新状态位
+应用通过轮询确认发送完成，回收mbuf内存
+
+物理口虚拟化技术
+这种虚拟化通常有三种层次：
+软件逻辑虚拟化：软件里把网卡的不同队列分配给不同的逻辑模块。
+        -----纯软件虚拟口,它不涉及网口,只涉及代码内部逻辑 全是逻辑
+VMDq (Virtual Machine Device Queues)：网卡硬件根据 MAC/VLAN 直接把包分发到特定的队列池，模拟出多个网卡。
+        ------涉及网卡转发
+SR-IOV：最彻底的硬件虚拟化。一个物理网卡（PF）直接裂变成多个虚拟网卡（VF），每个 VF 都有独立的寄存器空间。  
+        -------单物理网卡做多虚拟化网卡,涉及转发
+
+quest1:
+我读到这里有疑问:"网卡通过 DMA（直接存储器访问） 绕过 CPU，直接把报文数据写进那个物理地址指向的 Mbuf 数据区。 "
+这句话,我记得没错 mbuf是在池里,我如何能够快速得从池里找到物理地址对应得mbuf并写入的呢 
+dma我把它当作搬运工,搬完后把携带物理地址和报文数据的描述符放到ring里,然后读ring中的物理地址找mbuf
+,然后拷贝报文数据到mbuf,我想知道 物理地址如何找到mbuf的？
+
+answer1:
+1.并非包来了找地方存,而是本来就已经映射好了,收包的地方就是物理内存，
+像是一个双座的摩天轮,双座实际上一个是物理地址,一个虚拟地址,物理地址网卡直接调用,虚拟地址
+和物理地址本就归属同一结构.然后dma的扮演角色仅仅是把网卡的数据搬运到物理地址。
+quest2：
+触发写回（关键点）：状态机收到确认后，立刻构造一个状态更新包。
+这个包的目标地址就是 RX Ring 的第 5 个格子。它把这个格子的数据覆盖掉，标记上 DD=1。
+这句话 ，是网卡做的,这个状态更新包是把第五个格子的数据中的dd位修改并标记上1,那在dpdk中肯定有一个结构去描述每一个物理地址和dd位，
+它是什么,我要在源码中查看和梳理它.
+answer1:
+dd位的设置和结构：
+这个结构体叫做 硬件描述符（Hardware Descriptor），在dpdk底层中每种网卡硬件描述符均不相同,以Intel ixgbe (82599) 为例：
+在 DPDK 源码中，这个结构体通常定义在一个名为 ixgbe_type.h 或 ixgbe_rxtx.h 的文件中。它最巧妙的地方在于它是一个 union（共用体）。
+
+为什么是 union？因为它在不同阶段有不同的身份：
+Read 阶段：CPU 写，网卡读（告诉网卡 Mbuf 地址）。
+Write-back 阶段：网卡写，CPU 读（网卡回签 DD 位和报文长度）。
+下述代码可base25.11版本dpdk直接搜到
+/*硬件描述符*/
+union ixgbe_adv_rx_desc {
+    //网卡设备从这里得知
+	struct {
+		__le64 pkt_addr; /* Mbuf 的物理地址 (也叫 IOVA) */
+		__le64 hdr_addr; /* 包头地址 */
+	} read;
+	struct {
+		struct {
+			union {
+				__le32 data;
+				struct {
+					__le16 pkt_info; /* RSS, Pkt type 作何解释？*/
+					__le16 hdr_info; /* Splithdr, hdrlen 作何解释？*/
+				} hs_rss;
+			} lo_dword;
+			union {
+				__le32 rss; /* RSS Hash 网卡多队列的哈希值 */
+				struct {
+					__le16 ip_id; /* IP id ip报文序号 */
+					__le16 csum; /* 校验和 */
+				} csum_ip;
+			} hi_dword;
+		} lower;
+		struct {
+			__le32 status_error; /* ext status/error DD位就被设置在这里 */
+			__le16 length; /* 包长 */
+			__le16 vlan; /* VLAN tag */
+		} upper;
+	} wb;  /* writeback */
+};
+quest3：这不符合我对代码的认知 对么？ 不同的网卡使用不同的描述符,就算能够成功放到一个void*的环上,从事实上也不好去辨别他是哪个网卡。
+这让接口不统一,代码的规律性降低了.或者说实际上不同网卡的最后几位或几字节还是包前几位或几字节的值,都是相同的？
+
+answer3:
+DPDK 并不试图统一“硬件环”的格式，它只统一“软件接口”的结果.
+1. 物理上的隔离：一端口一驱动你担心的“放在一个环上无法辨别”的情况在物理上是不存在的 。
+每个物理网口（Port）在初始化时，都会根据其硬件型号加载特定的 PMD（轮询模式驱动） 。
+如果你有两块网卡（一块 Intel ixgbe，一块 Intel i40e），它们拥有各自独立的硬件环（Hardware Ring）内存空间 。
+ixgbe 的驱动代码只看 ixgbe 的环，i40e 的驱动只看 i40e 的环 。它们绝不会混在一起。
+*所有的硬件,其实都有他自己的驱动,这个初始化在eal_init的时候会根据不同的设备加载不同的驱动,对上层来说,接口相同,但是函数指针指向不同的设备。
+
+2. 逻辑上的多态：函数指针的妙用DPDK 应用层调用 rte_eth_rx_burst(port_id, ...) 时，这其实是一个统一的入口 。
+在内核内部，port_id 对应一个 struct rte_eth_dev 结构体，里面有一个函数指针 rx_pkt_burst 。
+ixgbe 网口：该指针指向 ixgbe_recv_pkts，它内部写死了处理 ixgbe_adv_rx_desc 的逻辑 。
+i40e 网口：该指针指向 i40e_recv_pkts，它处理的是 i40e 专有的描述符格式 。
+这就是规律性所在： 硬件的差异被“关”进了 drivers/net/ 下的各个驱动文件夹里，应用层看到的永远是标准化的 rte_mbuf 
+*对于这句话最好的解释： 下图是eth的操作描述符集,在其中很明显rx_pkt_burst这个函数就是底层分别去实现的,其实要我说
+*整个描述符都是通过函数指针去实现,借用了linux内核驱动和设备解耦的思想,使用file_ops类似的结构去结耦设备驱动和上层应用
+struct __rte_cache_aligned rte_eth_fp_ops {
+
+	/**@{*/
+	/**
+	 * Rx fast-path functions and related data.
+	 * 64-bit systems: occupies first 64B line
+	 */
+	/** Rx queues data. */
+	struct rte_ethdev_qdata rxq;
+	/** PMD receive function. */
+	eth_rx_burst_t rx_pkt_burst;
+	/** Get the number of used Rx descriptors. */
+	eth_rx_queue_count_t rx_queue_count;
+	/** Check the status of a Rx descriptor. */
+	eth_rx_descriptor_status_t rx_descriptor_status;
+	/** Refill Rx descriptors with the recycling mbufs. */
+	eth_recycle_rx_descriptors_refill_t recycle_rx_descriptors_refill;
+	uintptr_t reserved1[2];
+	/**@}*/
+
+	/**@{*/
+	/**
+	 * Tx fast-path functions and related data.
+	 * 64-bit systems: occupies second 64B line
+	 */
+	/** Tx queues data. */
+	struct rte_ethdev_qdata txq;
+	/** PMD transmit function. */
+	eth_tx_burst_t tx_pkt_burst;
+	/** PMD transmit prepare function. */
+	eth_tx_prep_t tx_pkt_prepare;
+	/** Check the status of a Tx descriptor. */
+	eth_tx_descriptor_status_t tx_descriptor_status;
+	/** Copy used mbufs from Tx mbuf ring into Rx. */
+	eth_recycle_tx_mbufs_reuse_t recycle_tx_mbufs_reuse;
+	/** Get the number of used Tx descriptors. */
+	eth_tx_queue_count_t tx_queue_count;
+	uintptr_t reserved2[1];
+	/**@}*/
+
+};
+
+
+DPDK 的逻辑是：先把坑挖好，把地址告诉网卡，包来了直接填坑。
+在网卡驱动初始化的时候，会有两个并行的“环形阵列”：
+Hardware Ring (硬件环)：给网卡看的，里面只存物理地址 (IOVA)。
+Software Ring (软件环)：给 CPU 看的，里面只存 struct rte_mbuf * 指针。
+这两个环的下标（Index）是完全对应的。
+
+1. 填坑阶段（驱动初始化或补包时）
+CPU 会从 Mempool 里取出一个 mbuf。
+它计算出这个 mbuf->data 区域的物理地址。
+它把这个物理地址填进 Hardware Ring 的第 5 个格子。
+它把这个 mbuf 的虚拟地址指针填进 Software Ring 的第 5 个格子。
+此时，第 5 个坑位已经和这个具体的 mbuf 绑定了。
+
+2. 搬运阶段（DMA 运作）
+包从网线进来了。网卡看了一眼 Hardware Ring 的第 5 个格子：
+“哦，物理地址是 0x12345600，搬运工（DMA）出发！”
+DMA 直接把报文数据写到了 0x12345600。
+注意：这个地址正好就是那个 mbuf 的数据区。数据此时已经躺在 mbuf 里了，根本不需要二次拷贝。
+
+3. 收割阶段（CPU 轮询）
+你的代码调用 rte_eth_rx_burst：
+CPU 轮询 Hardware Ring，发现第 5 个格子的 DD 位（Done）变 1 了。
+CPU 直接去 Software Ring 的第 5 个格子取回 struct rte_mbuf * 指针。
+瞬间完成：CPU 拿到了指针，指针指向的内存里已经有了数据。
