@@ -1,0 +1,378 @@
+25.11源码中的eal_init ‘
+它初始化了core的拓扑,初始化了大页,初始化了堆,方便内部程序申请释放内存,设置了所有线程和核心的cpu亲和性
+RTE_EXPORT_SYMBOL(rte_eal_init)
+int
+rte_eal_init(int argc, char **argv)
+{
+	int i, fctret, ret;
+	static RTE_ATOMIC(uint32_t) run_once;
+	uint32_t has_run = 0;
+	char cpuset[RTE_CPU_AFFINITY_STR_LEN];
+	char thread_name[RTE_THREAD_NAME_SIZE];
+	bool phys_addrs;
+	const struct rte_config *config = rte_eal_get_configuration();
+	struct internal_config *internal_conf =
+		eal_get_internal_configuration();
+
+	/* first check if we have been run before */
+	if (!rte_atomic_compare_exchange_strong_explicit(&run_once, &has_run, 1,
+					rte_memory_order_relaxed, rte_memory_order_relaxed)) {
+		rte_eal_init_alert("already called initialization.");
+		rte_errno = EALREADY;
+		return -1;
+	}
+
+	/* clone argv to report out later in telemetry 保存命令行参数 */
+	eal_save_args(argc, argv);
+
+	fctret = eal_collate_args(argc, argv);
+	if (fctret < 0) {
+		rte_eal_init_alert("Invalid command line arguments.");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+
+	/* setup log as early as possible 初始化日志 */
+	if (eal_parse_log_options() < 0) {
+		rte_eal_init_alert("invalid log arguments.");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+
+	eal_log_init(program_invocation_short_name);
+
+	/* checks if the machine is adequate 检查当前 CPU 指令集是否满足编译要求*/
+	if (!rte_cpu_is_supported()) {
+		rte_eal_init_alert("unsupported cpu type.");
+		rte_errno = ENOTSUP;
+		goto err_out;
+	}
+
+	/* verify if DPDK supported on architecture MMU 验证 MMU 是否受支持*/
+	if (!eal_mmu_supported()) {
+		rte_eal_init_alert("unsupported MMU type.");
+		rte_errno = ENOTSUP;
+		goto err_out;
+	}
+
+	eal_reset_internal_config(internal_conf);
+	/*校验和检查系统中的逻辑核和物理核，并生成对应拓扑*/
+	if (rte_eal_cpu_init() < 0) {
+		rte_eal_init_alert("Cannot detect lcores.");
+		rte_errno = ENOTSUP;
+		goto err_out;
+	}
+	/*解析命令行参数 到运行时便是可以直接使用的参数*/
+	if (eal_parse_args() < 0) {
+		rte_eal_init_alert("Error parsing command line arguments.");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+	/* 加载动态插件*/
+	if (eal_plugins_init() < 0) {
+		rte_eal_init_alert("Cannot init plugins");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+
+	if (eal_trace_init() < 0) {
+		rte_eal_init_alert("Cannot init trace");
+		rte_errno = EFAULT;
+		goto err_out;
+	}
+
+	if (eal_option_device_parse()) {
+		rte_errno = ENODEV;
+		goto err_out;
+	}
+	/*初始化 DPDK 全局配置结构体（rte_config_init*/
+	if (rte_config_init() < 0) {
+		rte_eal_init_alert("Cannot init config");
+		goto err_out;
+	}
+	/*设置中断处理函数*/
+	if (rte_eal_intr_init() < 0) {
+		rte_eal_init_alert("Cannot init interrupt-handling thread");
+		goto err_out;
+	}
+	/*定时告警初始化*/
+	if (rte_eal_alarm_init() < 0) {
+		rte_eal_init_alert("Cannot init alarm");	//一次性告警
+		/* rte_eal_alarm_init sets rte_errno on failure. */
+		goto err_out;
+	}
+
+	/* Put mp channel init before bus scan so that we can init the vdev
+	 * bus through mp channel in the secondary process before the bus scan.
+	 */
+	/*初始化 rte_mp_channel，这是主从进程通信的基础
+	*/
+	if (rte_mp_channel_init() < 0 && rte_errno != ENOTSUP) {
+		rte_eal_init_alert("failed to init mp channel");
+		if (rte_eal_process_type() == RTE_PROC_PRIMARY) {
+			rte_errno = EFAULT;
+			goto err_out;
+		}
+	}
+	/*总线扫描：调用 rte_bus_scan 扫描系统总线（如 PCIe），发现连接的硬件设备 。*/
+	if (rte_bus_scan()) {
+		rte_eal_init_alert("Cannot scan the buses for devices");
+		rte_errno = ENODEV;
+		goto err_out;
+	}
+
+	phys_addrs = rte_eal_using_phys_addrs() != 0;
+
+	/* Always call rte_bus_get_iommu_class() to trigger DMA mask detection and validation IOVA 模式确定：这是 DMA 的核心逻辑。*/
+	enum rte_iova_mode bus_iova_mode = rte_bus_get_iommu_class();
+
+	/* if no EAL option "--iova-mode=<pa|va>", use bus IOVA scheme */
+	/*EAL 会根据是否开启 IOMMU 以及用户配置，决定使用 IOVA-as-PA（物理地址模式）还是 IOVA-as-VA（虚拟地址模式）*/
+	if (internal_conf->iova_mode == RTE_IOVA_DC) {
+		/* autodetect the IOVA mapping mode */
+		enum rte_iova_mode iova_mode = bus_iova_mode;
+
+		if (iova_mode == RTE_IOVA_DC) {
+			EAL_LOG(DEBUG, "Buses did not request a specific IOVA mode.");
+
+			if (!RTE_IOVA_IN_MBUF) {
+				iova_mode = RTE_IOVA_VA;
+				EAL_LOG(DEBUG, "IOVA as VA mode is forced by build option.");
+			} else if (!phys_addrs) {
+				/* if we have no access to physical addresses,
+				 * pick IOVA as VA mode.
+				 */
+				iova_mode = RTE_IOVA_VA;
+				EAL_LOG(DEBUG, "Physical addresses are unavailable, selecting IOVA as VA mode.");
+			} else if (is_iommu_enabled()) {
+				/* we have an IOMMU, pick IOVA as VA mode */
+				iova_mode = RTE_IOVA_VA;
+				EAL_LOG(DEBUG, "IOMMU is available, selecting IOVA as VA mode.");
+			} else {
+				/* physical addresses available, and no IOMMU
+				 * found, so pick IOVA as PA.
+				 */
+				iova_mode = RTE_IOVA_PA;
+				EAL_LOG(DEBUG, "IOMMU is not available, selecting IOVA as PA mode.");
+			}
+		}
+		rte_eal_get_configuration()->iova_mode = iova_mode;
+	} else {
+		rte_eal_get_configuration()->iova_mode =
+			internal_conf->iova_mode;
+	}
+	//rte_eal_iova_mode()等价rte_eal_get_configuration()->iova_mode
+	if (rte_eal_iova_mode() == RTE_IOVA_PA && !phys_addrs) {
+		rte_eal_init_alert("Cannot use IOVA as 'PA' since physical addresses are not available");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+
+	if (rte_eal_iova_mode() == RTE_IOVA_PA && !RTE_IOVA_IN_MBUF) {
+		rte_eal_init_alert("Cannot use IOVA as 'PA' as it is disabled during build");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+
+	EAL_LOG(INFO, "Selected IOVA mode '%s'",
+		rte_eal_iova_mode() == RTE_IOVA_PA ? "PA" : "VA");
+	//初始化大页内存
+	if (internal_conf->no_hugetlbfs == 0) {
+		/* rte_config isn't initialized yet */
+		ret = internal_conf->process_type == RTE_PROC_PRIMARY ?
+				eal_hugepage_info_init() :
+				eal_hugepage_info_read();
+		if (ret < 0) {
+			rte_eal_init_alert("Cannot get hugepage information.");
+			rte_errno = EACCES;
+			goto err_out;
+		}
+	}
+
+	if (internal_conf->memory == 0 && internal_conf->force_numa == 0) {
+		if (internal_conf->no_hugetlbfs)
+			internal_conf->memory = MEMSIZE_IF_NO_HUGE_PAGE;
+	}
+
+	if (internal_conf->vmware_tsc_map == 1) {
+#ifdef RTE_LIBRTE_EAL_VMWARE_TSC_MAP_SUPPORT
+		rte_cycles_vmware_tsc_map = 1;
+		EAL_LOG(DEBUG, "Using VMWARE TSC MAP, "
+				"you must have monitor_control.pseudo_perfctr = TRUE");
+#else
+		EAL_LOG(WARNING, "Ignoring --vmware-tsc-map because "
+				"RTE_LIBRTE_EAL_VMWARE_TSC_MAP_SUPPORT is not set");
+#endif
+	}
+	//VFIO 开启：尝试启用 VFIO 驱动模块，以支持安全的用户态设备访问
+	if (rte_vfio_enable("vfio")) {
+		rte_eal_init_alert("Cannot init VFIO");
+		rte_errno = EAGAIN;
+		goto err_out;
+	}
+	/* in secondary processes, memory init may allocate additional fbarrays
+	 * not present in primary processes, so to avoid any potential issues,
+	 * initialize memzones first.
+	 */
+	//初始化内存区管理，用于分配连续的内存块
+	if (rte_eal_memzone_init() < 0) {
+		rte_eal_init_alert("Cannot init memzone");
+		rte_errno = ENODEV;
+		goto err_out;
+	}
+
+	rte_mcfg_mem_read_lock();
+	//内存映射初始化
+	if (rte_eal_memory_init() < 0) {
+		rte_mcfg_mem_read_unlock();
+		rte_eal_init_alert("Cannot init memory");
+		rte_errno = ENOMEM;
+		goto err_out;
+	}
+
+	/* the directories are locked during eal_hugepage_info_init */
+	eal_hugedirs_unlock();
+	//初始化堆 rte_melloc获取的就是这里初始化的内存
+	if (rte_eal_malloc_heap_init() < 0) {
+		rte_mcfg_mem_read_unlock();
+		rte_eal_init_alert("Cannot init malloc heap");
+		rte_errno = ENODEV;
+		goto err_out;
+	}
+
+	rte_mcfg_mem_read_unlock();
+
+	if (rte_eal_malloc_heap_populate() < 0) {
+		rte_eal_init_alert("Cannot init malloc heap");
+		rte_errno = ENODEV;
+		goto err_out;
+	}
+
+	/* register multi-process action callbacks for hotplug after memory init */
+	/*给不同线程(主线程和副线程)注册回调*/
+	if (eal_mp_dev_hotplug_init() < 0) {
+		rte_eal_init_alert("failed to register mp callback for hotplug");
+		goto err_out;
+	}
+
+	if (rte_eal_tailqs_init() < 0) {
+		rte_eal_init_alert("Cannot init tail queues for objects");
+		rte_errno = EFAULT;
+		goto err_out;
+	}
+	/*初始化定时器*/
+	if (rte_eal_timer_init() < 0) {
+		rte_eal_init_alert("Cannot init HPET or TSC timers");
+		rte_errno = ENOTSUP;
+		goto err_out;
+	}
+
+	eal_rand_init();
+
+	eal_check_mem_on_local_socket();
+	//设置主线程和主核的亲和性 main_lcore核rte_thread_self()
+	if (rte_thread_set_affinity_by_id(rte_thread_self(),
+			&lcore_config[config->main_lcore].cpuset) != 0) {
+		rte_eal_init_alert("Cannot set affinity");
+		rte_errno = EINVAL;
+		goto err_out;
+	}
+	__rte_thread_init(config->main_lcore,
+		&lcore_config[config->main_lcore].cpuset);
+
+	ret = eal_thread_dump_current_affinity(cpuset, sizeof(cpuset));
+	EAL_LOG(DEBUG, "Main lcore %u is ready (tid=%zx;cpuset=[%s%s])",
+		config->main_lcore, (uintptr_t)pthread_self(), cpuset,
+		ret == 0 ? "" : "...");
+	//遍历所有核心
+	RTE_LCORE_FOREACH_WORKER(i) {
+
+		/*
+		 * create communication pipes between main thread
+		 * and children
+		 * 为所有的核心和线程创建io管道
+		 */
+		if (pipe(lcore_config[i].pipe_main2worker) < 0)
+			rte_panic("Cannot create pipe\n");
+		if (pipe(lcore_config[i].pipe_worker2main) < 0)
+			rte_panic("Cannot create pipe\n");
+
+		lcore_config[i].state = WAIT;
+
+		/* create a thread for each lcore  位其他核心创建线程*/
+		ret = eal_worker_thread_create(i);
+		if (ret != 0)
+			rte_panic("Cannot create thread\n");
+
+		/* Set thread_name for aid in debugging. */
+		snprintf(thread_name, sizeof(thread_name),
+			"dpdk-worker%d", i);
+		rte_thread_set_name(lcore_config[i].thread_id, thread_name);
+		//设置其他线程和核心的cpu亲和性
+		ret = rte_thread_set_affinity_by_id(lcore_config[i].thread_id,
+			&lcore_config[i].cpuset);
+		if (ret != 0)
+			rte_panic("Cannot set affinity\n");
+	}
+
+	/*
+	 * Launch a dummy function on all worker lcores, so that main lcore
+	 * knows they are all ready when this function returns.
+	 */
+	rte_eal_mp_remote_launch(sync_func, NULL, SKIP_MAIN);
+	rte_eal_mp_wait_lcore();
+
+	/* initialize services so vdevs register service during bus_probe. */
+	ret = rte_service_init();
+	if (ret) {
+		rte_eal_init_alert("rte_service_init() failed");
+		rte_errno = -ret;
+		goto err_out;
+	}
+
+	/* Probe all the buses and devices/drivers on them */
+	if (rte_bus_probe()) {
+		rte_eal_init_alert("Cannot probe devices");
+		rte_errno = ENOTSUP;
+		goto err_out;
+	}
+
+	/* initialize default service/lcore mappings and start running. Ignore
+	 * -ENOTSUP, as it indicates no service coremask passed to EAL.
+	 */
+	ret = rte_service_start_with_defaults();
+	if (ret < 0 && ret != -ENOTSUP) {
+		rte_errno = -ret;
+		goto err_out;
+	}
+
+	/*
+	 * Clean up unused files in runtime directory. We do this at the end of
+	 * init and not at the beginning because we want to clean stuff up
+	 * whether we are primary or secondary process, but we cannot remove
+	 * primary process' files because secondary should be able to run even
+	 * if primary process is dead.
+	 *
+	 * In no_shconf mode, no runtime directory is created in the first
+	 * place, so no cleanup needed.
+	 */
+	if (!internal_conf->no_shconf && eal_clean_runtime_dir() < 0) {
+		rte_eal_init_alert("Cannot clear runtime directory");
+		goto err_out;
+	}
+	if (rte_eal_process_type() == RTE_PROC_PRIMARY && !internal_conf->no_telemetry) {
+		if (rte_telemetry_init(rte_eal_get_runtime_dir(),
+				rte_version(),
+				&internal_conf->ctrl_cpuset) != 0)
+			goto err_out;
+	}
+
+	eal_mcfg_complete();
+
+	return fctret;
+
+err_out:
+	rte_atomic_store_explicit(&run_once, 0, rte_memory_order_relaxed);
+	eal_clean_saved_args();
+	return -1;
+}
