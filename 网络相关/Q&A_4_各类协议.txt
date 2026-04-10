@@ -124,18 +124,21 @@ OSPF 是典型的链路状态路由协议，主要用于企业内网（IGP）
 邻居发现：通过 Hello 报文互相认识。
 同步 LSDB：大家交换 LSA（链路状态通告），直到每个路由器的数据库（LSDB）都一模一样。
 计算路径：每个路由器以自己为根，利用 SPF (Dijkstra) 算法计算出一棵最短路径树。
+DR/BDR:指定路由器,备份指定路由器
 状态机:
-| Down | 初始状态，还没收到 Hello 包。 |
-| Init | 收到邻居的 Hello，但对方的邻居列表里还没我。 |
-| 2-Way | 互相认识了，邻居关系建立完成（DR/BDR 选举在此阶段）。 |
-| ExStart | 准备交换信息，确定主从关系（确定序列号）。 |
-| Exchange | 交换 DD 报文，描述自己的数据库摘要。 |
-| Loading | 发现对方有我没有的，发送 LSR 请求，对方回复 LSU。 |
-| Full | 数据库同步完成，邻接关系建立完成。 |
+| Down | 初始状态，还没收到 Hello 包。 | 无报文交互 |
+| Init | 收到邻居的 Hello，但对方的邻居列表里还没我。 | Hello报文(Type 1) |
+| 2-Way | 互相认识了，邻居关系建立完成（DR/BDR 选举在此阶段）。 | Hello报文(Type 1) |
+| ExStart | 准备交换信息，确定主从关系（确定序列号）。 | Empty DBD (Type 2)报文 |
+| Exchange | 交换 DD 报文，描述自己的数据库摘要。 | Summary DBD (Type 2)报文 |
+| Loading | 发现对方有我没有的，发送 LSR 请求，对方回复 LSU。 | LSR / LSU / LSAck |
+| Full | 数据库同步完成，邻接关系建立完成。 | Hello (维持) |
 quest: DR,BDR选举是什么东西,主从关系确定？这不是"人人为我我为人人"的协议吗,类似去中心化的协议,何来主从？,DD报文是什么,
 LSR报文是什么,LSU报文又是什么。FULL应该类似finish的状态吧?
 answer:
-ospf通用报文头-----
+DD报文：DD 报文，全称是 Database Description Packet（在很多文档里也写作 DBD），中文叫 “数据库描述报文”，
+它装的是本路由器数据库里所有 LSA 的 Header（头部信息），而不包含具体的路由路径、度量值等细节
+--------------------------ospf通用报文头-----
 一、 OSPF 公共报文头部 (24 Bytes)所有的 OSPF 报文开头都长一样，这是路由器的“初次见面礼”。
 偏移 (Byte)          字段                    关键点
 0                  Version                 ip版本 IPv4 是 2，IPv6 (OSPFv3) 是 3。
@@ -193,7 +196,7 @@ quest:Router Id的大小怎么决定,毕竟网络是一个网络图，起点在�
 通俗比喻：就像你看了对方的菜单（DBD），然后指着其中两道菜说：“这两道我没吃过，请给我详细介绍一下做法（LSU）。”
 状态机位置：发完 LSR，路由器就进入了 Loading（加载） 状态。
 
-4. LSU 报文 (Type 4)
+4. LSU(Link State Update) 报文 (Type 4)
 LSU 是 OSPF 最重头的报文，因为它包含了真正的 LSA (Link State Advertisement)。
 
 5.LSAck (Link State Acknowledgment) —— Type 5 “收条/确认函”
@@ -292,6 +295,8 @@ DIS:自治域组长
 hello报文交互,得知对方路由信息
 
 第二阶段：数据库同步状态机 (LSP/CSNP/PSNP)
+LSP:Link State Protocol Data Unit（链路状态协议数据单元）   CSNP:Complete Sequence Number Protocol Data Unit（全序列号协议数据单元）
+PSNP:Partial Sequence Number Protocol Data Unit（部分序列号协议数据单元）
 1. 广播网 (LAN) 模式 —— 
 在以太网里，为了省事，大家不私下交易，靠DIS规划。
 建立 Up 后：所有路由器立刻向组播地址发送自己的 LSP（我的路由信息）。
@@ -314,3 +319,105 @@ DIS 的动作：DIS 收集所有人的 LSP，汇总成一个大目录 CSNP，然
 请求更新,PSNP          发现目录不符时，主动求货       发现目录不符时，主动求货
 发送路由,LSP           触发式发送                    触发式发送
 收货确认,PSNP          无（靠下一次 CSNP 隐式确认）   必须有（作为 Ack 报文）
+BGP:
+bgp的状态机
+状态            报文交互              描述                                           动作
+Idle              无                初始状态                                拒绝所有连接，等待开始信号。
+Connect          Tcp SYN        尝试建立 TCP                     正在跟对方进行 TCP 三次握手。成功则转 OpenSent。
+Active           Tcp SYN        TCP 失败（坑！）            TCP 没连上。BGP 会在这里不停重试。如果你看到这个状态，说明网络不通或者配置有误。
+OpenSent    Open (Type 1)       已发 Open 包                      TCP 好了，我把我的“名片”（Open 报文）发给你了。
+OpenConfirm Keepalive (Type 3)     确认中                         我收到了你的名片，正等着你回一个“收到”（Keepalive）。
+Established   UPDATE (Type 2)      最终态                          握手彻底完成。大家开始交换路由（Update）。
+BGP 的 4 种报文类型
+BGP 的报文结构非常固定，开头都有一个 16 字节的全 1 标记（Marker）用来同步。
+    Open (Type 1)：
+    作用：建立邻居。包含：BGP 版本、自己的 AS 号、Hold Time、BGP Identifier（类似 Router ID）。
+
+    Update (Type 2)：
+    作用：最核心报文。里面塞满了路由信息。
+    包含：撤销路由列表（我不用的路）、路径属性（AS-Path 等）、可达路由前缀（NLRI）。
+
+    Keepalive (Type 3)：
+    作用：续命。默认 60 秒发一次。如果 180 秒没收到，邻居直接断开。
+
+    Notification (Type 4)：
+    作用：报错。一旦发现不对劲（比如 AS 号配错了），发完这个包立刻断开连接。
+
+BGP 的路径属性 (Path Attributes)
+
+AS-Path：记录这条路由经过了哪些 AS。
+防环路：如果你收到的路由里有自己的 AS 号，直接扔掉。
+选路：经过的 AS 越少，路径通常越优。
+Next Hop：下一跳是谁。
+Local Preference：告诉家里人，出家门走哪条路更好（控制流出）。
+MED (Multi-Exit Discriminator)：告诉邻居，进我家门走哪个口（控制流入）。
+***************************************************************************************************************************
+isis,ospf与bgp的区别和关系：ospf和isis是as内交换路由,bgp是as间交换路由。
+对于这个关系要说到IGP(Interior Gateway Protocol - 内部网关协议)和EGP(Exterior Gateway Protocol - 外部网关协议).
+
+IGP (Interior Gateway Protocol - 内部网关协议)：
+代表：OSPF、IS-IS。
+范围：在一个 AS内部运行。
+核心目标：速度。它们追求以最快的速度算出一张全图，让包在AS内跑得最顺溜。
+
+EGP (Exterior Gateway Protocol - 外部网关协议)：
+代表：BGP（目前互联网上唯一的 EGP）。
+范围：在 AS 与 AS 之间运行。
+核心目标：控制与策略。它不关心路径是不是最短，它关心的是“这跳路费贵不贵”、“走这路安不安全”。
+两者缺一不可,就像是网关只用关心子网,和一个小网段一样
+如果只用BGP 的话：BGP 建立在 TCP 之上，收敛速度（发现路断了到重新选好路的时间）按分钟计。而 OSPF/IS-IS 可以在几百毫秒内完成。
+如果只用OSPF 的话：OSPF 要求每个交换机手里都有一张全邻居路由。如果把整个互联网 100 多万条路由全塞进 OSPF，路由器的 CPU 会直接烧掉。
+
+维度                    OSPF / IS-IS (IGP)              BGP (EGP)
+工作范围                    AS 内部                 AS 之间（及边界）
+关注点              链路状态、最短路径、速度        路由策略、AS 路径、稳定性
+算法基础                SPF (Dijkstra)              路径矢量 (Path Vector)
+承载能力            通常几千到上万条路由                100 万+ 全网路由
+底层协议                IP(89) / 直接跑在二层               TCP (179)
+
+层级,名称,关键标识,典型协议
+L5,应用层,消息/数据,HTTP, DNS, BGP
+L4,传输层,端口号,TCP, UDP
+L3,网络层,IP 地址,IP, ICMP, OSPF
+L2,数据链路层,MAC 地址,Ethernet, IS-IS
+L1,物理层,电信号/比特流,电缆, 光纤
+二层转发和三层转发:
+二层转发是指的拆包拆到第二层,三层转发指的是拆到第三层.
+
+对于转发而言(vxlan/srv6)
+SRv6：外层 IPv6 的 Source Address 是你自己，Destination Address（或 SRH 里的 SID）是对端。
+VXLAN：外层 IP 的 Source IP 是你自己，Dest IP 是对端，UDP 端口是 4789，还要填入 VNI。
+
+EVPN其实是隶属于BGP下的一个协议族
+
+BGP 有一个天生的优势：扩展性极强。
+以前的 BGP 只会传 IPv4 路由（“去这个 IP 走哪”）。
+后来有了 MP-BGP（多协议 BGP），它变得像个万能插件架，可以传 IPv6、传 VPNv4。
+现在，大家给 BGP 增加了一种新的插件，叫 EVPN (AFI=25, SAFI=70)。有了它，BGP 就可以传 MAC 地址 和 终端 IP 了。
+
+2. EVPN 到底在 BGP 里传什么？
+TCP端口 179
+EVPN 定义了几种专用的“路由类型”（Route Types），这就像是不同格式的快递单：
+Type 2（MAC/IP 路由）：最常用！ 告诉全网：“MAC 地址 A 挂在我这个 VTEP 下面，对应的内层 IP 是 X”。
+Type 3（网通路由）：用来建立隧道，处理 BUM（广播、组播、未知单播）流量。
+Type 5（前缀路由）：用来传网段信息，实现不同 VNI 之间的三层互通。
+
+quest:bgp不是已经打通as间的路了吗,为什么还需要evpn去搭桥多此一举?
+answer:bgp解决了两个as打通的问题.
+evpn解决了两个as间两个设备想用同一个ip且不冲突的问题 比如说as1里的mac-a ip-1想和as2里的mac-b ip-1交互的问题.
+
+Type 2 到底是什么？（MAC/IP 路由）
+在你刚才说的那个 255 台手机的场景里，Type 2 路由的作用就是**“户口登记”**。
+它的内容：它告诉全网，“手机 A（MAC-A, IP-1.5）在交换机 1 后面，请封进 VNI 1000”。
+它的角色：它是 BGP 报文里的一个信息条目。
+
+在 EVPN 里，真正负责“打通隧道”的消息其实是 Type 3 路由 (Inclusive Multicast Route)：
+Type 3 的任务：它是交换机之间互打招呼
+
+在 BGP EVPN 中，如果你听到有人聊 UMR，他其实是在聊 BUM 流量（Broadcast 广播, Unknown-unicast 未知单播, Multicast 组播）的处理规则。
+
+逻辑：
+Type 2 是精准导航。(mac/ip)
+UMR/Type 3 是“广播寻人”。
+作用：当你的交换机收到一个包，但在 EVPN 表里查不到目的地（比如一个新的手机刚插上，还没来得及发 Type 2 报文），交换机不能直接丢包啊！
+它会根据 UMR (Unknown Multicast Route) 规则，把这个包复制一份，发给所有建立过隧道的邻居
