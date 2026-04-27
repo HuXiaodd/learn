@@ -1,4 +1,4 @@
-25.11源码中的eal_init ‘
+25.11源码中的eal_init
 它初始化了core的拓扑,初始化了大页,初始化了堆,方便内部程序申请释放内存,设置了所有线程和核心的cpu亲和性
 RTE_EXPORT_SYMBOL(rte_eal_init)
 int

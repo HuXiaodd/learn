@@ -116,7 +116,11 @@ DHCP Discover 是广播包。广播不能跨路由器。
 Circuit ID：用户在哪台接入交换机的哪个端口。
 Remote ID：用户的身份标识（通常是 MAC）。
 面试点：在网关开发中，我们需要解析并插入 Option 82，防止地址欺骗（即：A 用户不能用 B 用户的身份申请 IP）。
-
+************************************************************************************
+当IP数据包超过MTU限制时，会被路由器或发送端在IP层分片。接收端通过以下关键字段识别和重组分片：
+Identification（16位标识符）：同一原始IP数据包的所有分片共享完全相同的标识值，这是重组的基础。
+Fragment Offset（13位片偏移）：指示该分片在原始数据包中的起始位置（以8字节为单位）。
+Flags（3位标志）：特别是MF（More Fragments）位，为1表示后面还有分片，为0表示这是最后一个分片。
 ***********************************************************************************************
 目标:搞清楚ospf,isis,bgp,vxlan,evpn
 OSPF 是典型的链路状态路由协议，主要用于企业内网（IGP）
@@ -440,6 +444,64 @@ RTSP协议栈:RTSP 是一个明确定义在 TCP/IP 模型应用层的协议，�
         UDP: 常用于传输 RTP 的实时音视频数据，以降低延迟。
     3.网络层及以下 (Network Layer and Below):
         IP: 负责网络寻址和路由。
+rtsp的协议形式:类似http tcp/udp端口554
+rtp/avp/tcp
+rtp/avp/ucp
+控制协议：专门用于建立、控制和终止媒体会话
+有状态协议：与无状态的HTTP不同，RTSP通过Session ID维护会话状态
+类HTTP语法：采用类似HTTP的文本化请求-响应模型，但功能更专注于流媒体控制
+rtsp流程举例：
+1.Options：客户端查询服务器支持的方法
+    C→S: OPTIONS rtsp://example.com RTSP/1.0
+    S→C: RTSP/1.0 200 OK
+    Public: DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN
+
+2.DESCRIBE：获取媒体描述（SDP格式）
+    C→S: DESCRIBE rtsp://example.com/stream RTSP/1.0
+    S→C: RTSP/1.0 200 OK
+    Content-Type: application/sdp
+    v=0
+    o=- 0 0 IN IP4 192.168.1.1
+    s=Live Stream
+    m=video 5004 RTP/AVP 96
+    a=rtpmap:96 H264/90000
+3.SETUP：建立传输通道（协商RTP/RTCP参数）
+    C→S: SETUP rtsp://example.com/stream/track0 RTSP/1.0
+    Transport: RTP/AVP/UDP;unicast;client_port=5000-5001
+    S→C: RTSP/1.0 200 OK
+    Session: 12345678
+    Transport: RTP/AVP/UDP;unicast;client_port=5000-5001;server_port=6000-6001
+4.PLAY：启动流传输
+    C→S: PLAY rtsp://example.com/stream RTSP/1.0
+    Session: 12345678
+    S→C: RTSP/1.0 200 OK
+    Session: 12345678
+    RTP-Info: url=track0;seq=1000
+5.PAUSE/TEARDOWN：暂停或终止会话
+    C→S: PAUSE rtsp://example.com/stream RTSP/1.0
+    Session: 12345678
+AVP（Audio/Video Profile）是RTP协议中专为音视频传输设计的配置文件，在RTSP协议栈中作为RTP的传输规范，
+定义了音视频数据如何封装在RTP包中进行传输，与传输层协议（UDP或TCP）结合形成完整的传输方案
+| 方法 | 方向 | 功能 | 特点 |
+|---------|---------|---------|---------|
+| OPTIONS | C→S | 查询服务器支持的方法 | 常用于保活和能力探测 |
+| DESCRIBE | C→S | 获取媒体描述(SDP格式) | 包含编码格式、传输参数等元信息 |
+| SETUP | C→S | 建立传输通道 | 协商RTP/RTCP传输参数，分配Session ID |
+| PLAY | C→S | 启动流传输 | 可指定起始时间点(Range头) |
+| PAUSE | C→S | 暂停传输 | 保持会话，可快速恢复 |
+| TEARDOWN | C→S | 终止会话 | 释放所有资源 |
+| GET_PARAMETER | C→S/S→C | 查询参数值 | 用于获取会话状态 |
+| SET_PARAMETER | C→S/S→C | 设置参数值 | 用于调整传输参数 |
+
+//rtsp通过协议转换网关接server时,中间网关会把rtsp的流解出来并用hls和srt发给server
+| 特性 | RTSP | HLS | SRT |
+| :--- | :--- | :--- | :--- |
+| 核心定位 | 设备控制（如摄像头云台转动） | 终端分发（网页、手机看视频） | 骨干传输（长距离、跨公网推流） |
+| 传输协议 | TCP/UDP | HTTP (TCP) | UDP (带纠错) |
+| 延迟表现 | 极低 (< 500ms) | 较高 (10s ~ 30s) | 极低 (< 1s) |
+| 防火墙穿透 | 差 (需开放特定端口) | 极好 (走 80/443 端口) | 好 (可配置端口) |
+| 抗丢包能力 | 弱 | 强 (通过 HTTP 重传) | 极强 (ARQ 机制) |
+| 典型场景 | 局域网监控、视频会议 | 直播网站、点播平台 | 远程医疗、跨地域直播连线 |
 
 ONVIF:
 | 角色      | 技术名称      | 在 ONVIF 中的具体作用 | 通俗比喻 |
@@ -448,3 +510,12 @@ ONVIF:
 | 沟通通道  | Web Service   | 提供标准的 HTTP 接口地址（URL），让录像机能访问摄像头的功能。      | 电话线：找到人后，拨通对方的专用服务热线。 |
 | 沟通语言  | SOAP (XML)    | 将指令（如“打开视频流”）封装成标准的 XML 文本，确保双方都能读懂。  | 普通话：不管你是哪里人，必须用标准格式说话，否则听不懂。 |
 | 最终目的  | ONVIF         | 规定上述技术必须怎么用，以及具体的业务逻辑（如 Profile S 标准）。   | 规章制度：规定大家必须用普通话通过电话线进行点名和沟通。 |
+*********************************************************************************
+APDU硬件协议(eSIM卡)
+| 字节 | 名称 | 含义 | 通俗解释 |
+| :--- | :--- | :--- | :--- |
+| 第 1 字节 | CLA | 指令类别 | 告诉卡片：这是哪一类指令？（比如是通用的 ISO 指令，还是厂商自定义的指令）。 |
+| 第 2 字节 | INS | 指令代码 | 告诉卡片：你要干什么？（比如 `A4` 代表选择文件，`B0` 代表读取二进制数据）。 |
+| 第 3 字节 | P1 | 参数 1 | 具体的参数（比如从哪里开始读）。 |
+| 第 4 字节 | P2 | 参数 2 | 具体的参数（比如读多少）。 |
+| 第 5+ 字节 | Data/Lc/Le | 数据/长度 | 可选的。如果有数据发给卡片，就在这里；如果要从卡片读数据，也要告诉它预期长度。 |
